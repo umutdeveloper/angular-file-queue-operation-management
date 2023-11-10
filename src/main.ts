@@ -3,7 +3,7 @@ import { Component, Injectable } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { bootstrapApplication } from '@angular/platform-browser';
 
-import { Observable, Subject, Subscription, merge, interval } from 'rxjs';
+import { Observable, Subject, Subscription, merge, interval, combineLatest } from 'rxjs';
 import {
   distinctUntilChanged,
   filter,
@@ -26,10 +26,7 @@ export interface FileOperation {
 }
 
 type FileOperationType = 'download' | 'upload';
-type FileOperationEvent = {
-  type: 'start' | 'complete';
-  operation: FileOperation;
-};
+type FileOperationEvent = { type: 'start' | 'complete'; operation: FileOperation; };
 
 const MAX_CONCURRENT_OPERATIONS = 5;
 const MAX_LARGE_FILE_OPERATIONS = 2;
@@ -39,39 +36,51 @@ const LARGE_FILE_SIZE = 25 * 1024 * 1024;
   providedIn: 'root',
 })
 export class FileOperationService {
-  constructor() {}
+  constructor() { }
 
   private operationSub$ = new Subject<FileOperation>();
-  private operation$ = this.operationSub$.asObservable().pipe(shareReplay(1));
   private operationEventSub$ = new Subject<FileOperationEvent>();
   private operationSubscription?: Subscription;
 
   // External access to operation events for other components and services
-  readonly operationEvent$ = this.operationEventSub$
-    .asObservable()
-    .pipe(shareReplay(1));
+  readonly operation$ = this.operationSub$.asObservable().pipe(shareReplay(1));
+  readonly operationEvent$ = this.operationEventSub$.asObservable().pipe(shareReplay(1));
+
+  private pendingOperationFileIds$ = this.getPendingOperations$(this.operation$, this.operationEvent$);
 
   addFileOperation(operation: FileOperation): void {
     this.operationSub$.next(operation);
     if (!this.operationSubscription) {
-      this.initSubscription(this.operation$.pipe(startWith(operation)));
+      this.initSubscription(this.operation$);
     }
+  }
+
+  isFileOperating$(fileId: string) {
+    return this.pendingOperationFileIds$.pipe(
+      map((fileIds) => fileIds.includes(fileId)),
+      startWith(false)
+    );
+  }
+
+  private getPendingOperations$(
+    operation$: Observable<FileOperation>,
+    operationEvent$: Observable<FileOperationEvent>
+  ) {
+    const queuedOperations$ = this.getOperationsQueue$(operation$, operationEvent$);
+    const activeOperations$ = this.getActiveOperations$(operationEvent$);
+    return combineLatest([queuedOperations$, activeOperations$]).pipe(
+      map(([queuedOperations, activeOperations]) => [
+        ...new Set(queuedOperations.concat(activeOperations).map((op) => op.fileId)),
+      ]),
+      startWith([] as string[])
+    );
   }
 
   private initSubscription(operation$: Observable<FileOperation>) {
     const uploadOperation$ = this.filterOperationByType$(operation$, 'upload');
-    const uploadOperationEvent$ = this.filterOperationEventByType$(
-      this.operationEvent$,
-      'upload'
-    );
-    const downloadOperation$ = this.filterOperationByType$(
-      operation$,
-      'download'
-    );
-    const downloadOperationEvent$ = this.filterOperationEventByType$(
-      this.operationEvent$,
-      'download'
-    );
+    const uploadOperationEvent$ = this.filterOperationEventByType$(this.operationEvent$, 'upload');
+    const downloadOperation$ = this.filterOperationByType$(operation$, 'download');
+    const downloadOperationEvent$ = this.filterOperationEventByType$(this.operationEvent$, 'download');
     this.operationSubscription = merge(
       this.bufferOperations(uploadOperation$, uploadOperationEvent$),
       this.bufferOperations(downloadOperation$, downloadOperationEvent$)
@@ -96,36 +105,14 @@ export class FileOperationService {
     return isLarge ? op.size > LARGE_FILE_SIZE : op.size <= LARGE_FILE_SIZE;
   }
 
-  private bufferOperations(
-    operation$: Observable<FileOperation>,
-    operationEvent$: Observable<FileOperationEvent>
-  ) {
-    const operationsQueue$ = this.getOperationsQueue$(
-      operation$,
-      operationEvent$
-    );
+  private bufferOperations(operation$: Observable<FileOperation>, operationEvent$: Observable<FileOperationEvent>) {
+    const operationsQueue$ = this.getOperationsQueue$(operation$, operationEvent$);
     const activeOperationsQueue$ = this.getActiveOperations$(operationEvent$);
-    const operationCompleted$ = operationEvent$.pipe(
-      filter((event) => event.type === 'complete')
-    );
-    const nextNormalOperation$ = this.getNextOperation$(
-      operationCompleted$,
-      operationsQueue$
-    );
-    const nextLargeOperation$ = this.getNextOperation$(
-      operationCompleted$,
-      operationsQueue$,
-      true
-    );
-    const normalOperationHandler$ = this.getOperationHandler$(
-      nextNormalOperation$,
-      activeOperationsQueue$
-    );
-    const largeOperationHandler$ = this.getOperationHandler$(
-      nextLargeOperation$,
-      activeOperationsQueue$,
-      true
-    );
+    const operationCompleted$ = operationEvent$.pipe(filter((event) => event.type === 'complete'));
+    const nextNormalOperation$ = this.getNextOperation$(operationCompleted$, operationsQueue$);
+    const nextLargeOperation$ = this.getNextOperation$(operationCompleted$, operationsQueue$, true);
+    const normalOperationHandler$ = this.getOperationHandler$(nextNormalOperation$, activeOperationsQueue$);
+    const largeOperationHandler$ = this.getOperationHandler$(nextLargeOperation$, activeOperationsQueue$, true);
     return merge(normalOperationHandler$, largeOperationHandler$);
   }
 
@@ -134,27 +121,18 @@ export class FileOperationService {
     activeOperationsQueue$: Observable<FileOperation[]>,
     isLarge?: boolean
   ) {
-    const maxOperations = isLarge
-      ? MAX_LARGE_FILE_OPERATIONS
-      : MAX_CONCURRENT_OPERATIONS;
+    const maxOperations = isLarge ? MAX_LARGE_FILE_OPERATIONS : MAX_CONCURRENT_OPERATIONS;
     // Active count includes all items if isLarge is false. 5 for all, 2 for large files.
     const activeOpCount$ = activeOperationsQueue$.pipe(
-      map(
-        (ops) =>
-          ops.filter((op) => (isLarge ? this.checkSize(op, true) : true)).length
-      )
+      map((ops) => ops.filter((op) => (isLarge ? this.checkSize(op, true) : true)).length)
     );
     return nextOperation$.pipe(
       withLatestFrom(activeOpCount$),
       filter(([_, activeOpCount]) => activeOpCount < maxOperations),
-      tap(([operation]) =>
-        this.operationEventSub$.next({ type: 'start', operation })
-      ),
+      tap(([operation]) => this.operationEventSub$.next({ type: 'start', operation })),
       mergeMap(([operation]) =>
         operation.operation$.pipe(
-          tap(() =>
-            this.operationEventSub$.next({ type: 'complete', operation })
-          )
+          tap(() => this.operationEventSub$.next({ type: 'complete', operation }))
         )
       )
     );
@@ -180,17 +158,13 @@ export class FileOperationService {
     );
   }
 
-  private getActiveOperations$(
-    operationEvent$: Observable<FileOperationEvent>
-  ) {
+  private getActiveOperations$(operationEvent$: Observable<FileOperationEvent>) {
     return operationEvent$.pipe(
       scan((ops: FileOperation[], event: FileOperationEvent) => {
         if (event.type === 'start') {
           ops.push(event.operation);
         } else if (event.type === 'complete') {
-          const operationIndex = ops.findIndex(
-            (op) => op.fileId === event.operation.fileId
-          );
+          const operationIndex = ops.findIndex((op) => op.fileId === event.operation.fileId);
           if (operationIndex > -1) {
             ops.splice(operationIndex, 1);
           }
