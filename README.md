@@ -1,3 +1,5 @@
-# angular-file-queue-operation-management
+# Angular File Queue Operation Management
 
-[Edit in Codeflow ⚡️](https://stackblitz.com/~/github.com/umutdeveloper/angular-file-queue-operation-management)
+An Angular service that manages the total concurrent download and upload operations to limit them to prevent bandwidth issues and provide stability in the application.
+
+[Stackblitz ⚡️](https://stackblitz.com/edit/angular-file-queue-operation-management)
