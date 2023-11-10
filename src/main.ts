@@ -3,7 +3,7 @@ import { Component, Injectable } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { bootstrapApplication } from '@angular/platform-browser';
 
-import { Observable, Subject, Subscription, merge, interval, combineLatest } from 'rxjs';
+import { Observable, ReplaySubject, Subscription, merge, interval, combineLatest, of } from 'rxjs';
 import {
   distinctUntilChanged,
   filter,
@@ -16,6 +16,7 @@ import {
   tap,
   withLatestFrom,
   take,
+  catchError
 } from 'rxjs/operators';
 
 export interface FileOperation {
@@ -26,7 +27,7 @@ export interface FileOperation {
 }
 
 type FileOperationType = 'download' | 'upload';
-type FileOperationEvent = { type: 'start' | 'complete'; operation: FileOperation; };
+type FileOperationEvent = { type: 'start' | 'complete'; operation: FileOperation; error?: unknown };
 
 const MAX_CONCURRENT_OPERATIONS = 5;
 const MAX_LARGE_FILE_OPERATIONS = 2;
@@ -38,13 +39,13 @@ const LARGE_FILE_SIZE = 25 * 1024 * 1024;
 export class FileOperationService {
   constructor() { }
 
-  private operationSub$ = new Subject<FileOperation>();
-  private operationEventSub$ = new Subject<FileOperationEvent>();
+  private operationSub$ = new ReplaySubject<FileOperation>(1);
+  private operationEventSub$ = new ReplaySubject<FileOperationEvent>(1);
   private operationSubscription?: Subscription;
 
   // External access to operation events for other components and services
-  readonly operation$ = this.operationSub$.asObservable().pipe(shareReplay(1));
-  readonly operationEvent$ = this.operationEventSub$.asObservable().pipe(shareReplay(1));
+  readonly operation$ = this.operationSub$.asObservable();
+  readonly operationEvent$ = this.operationEventSub$.asObservable();
 
   private pendingOperationFileIds$ = this.getPendingOperations$(this.operation$, this.operationEvent$);
 
@@ -132,7 +133,11 @@ export class FileOperationService {
       tap(([operation]) => this.operationEventSub$.next({ type: 'start', operation })),
       mergeMap(([operation]) =>
         operation.operation$.pipe(
-          tap(() => this.operationEventSub$.next({ type: 'complete', operation }))
+          tap(() => this.operationEventSub$.next({ type: 'complete', operation })),
+          catchError((error) => {
+            this.operationEventSub$.next({ type: 'complete', operation, error });
+            return of();
+          })
         )
       )
     );
@@ -171,7 +176,7 @@ export class FileOperationService {
         }
         return ops;
       }, []),
-      startWith([]),
+      startWith([] as FileOperation[]),
       shareReplay(1)
     );
   }
@@ -197,10 +202,12 @@ export class FileOperationService {
         }
         return ops;
       }, []),
+      startWith([] as FileOperation[]),
       shareReplay(1)
     );
   }
 }
+
 
 @Component({
   selector: 'my-app',
